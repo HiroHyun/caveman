@@ -1,0 +1,73 @@
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Save the fork-only .github directory
+        run: cp -r .github "$RUNNER_TEMP/fork-github"
+
+      - name: Take upstream's tree whole
+        run: |
+          git remote add upstream https://github.com/JuliusBrussee/caveman.git
+          git fetch upstream main
+          git reset --hard upstream/main
+
+      - name: Restore the fork-only .github directory
+        run: |
+          rm -rf .github
+          cp -r "$RUNNER_TEMP/fork-github" .github
+
+      - name: Prune to the plugin surface
+        run: sh .github/prune.sh
+
+      - name: Validate the pruned tree
+        run: |
+          python3 -m json.tool .claude-plugin/marketplace.json > /dev/null
+          python3 -m json.tool .claude-plugin/plugin.json > /dev/null
+          test ! -e bin
+          test -f src/hooks/caveman-activate.js
+          test -f src/hooks/caveman-mode-tracker.js
+          fail=0
+          while IFS= read -r -d '' f; do
+            s=$(stat -c%s "$f")
+            [ "$s" -lt 200 ] && continue
+            c=$(gzip -9 -c "$f" | wc -c)
+            r=$((s / c))
+            if [ "$r" -ge 40 ]; then
+              echo "::error file=$f::compression ratio ${r}:1 exceeds the hosted-plugin limit of 50:1"
+              fail=1
+            fi
+          done < <(find . -path ./.git -prune -o -type f -print0)
+          exit $fail
+        shell: bash
+
+      - name: Commit the pruned tree
+        run: |
+          git add -A
+          git diff --cached --quiet || git commit -m 'Prune to the Claude Code plugin surface
+
+          Keeps .claude-plugin, src, commands, agents, and skills, which are the
+          paths the plugin loads, plus the licenses and README. The claude.ai-hosted
+          validator inspects the whole plugin root, and upstream ships files it
+          rejects. Regenerated from upstream by .github/workflows/sync-upstream.yml.'
+
+      - name: Force-push the rebuilt branch
+        run: git push --force origin main
